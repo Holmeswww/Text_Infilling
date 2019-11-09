@@ -1,5 +1,5 @@
 import tensorflow as tf
-import texar as tx
+import texar.tf as tx
 import os
 
 

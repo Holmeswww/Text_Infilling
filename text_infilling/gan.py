@@ -25,14 +25,326 @@ import codecs
 from matplotlib import pyplot as plt
 plt.switch_backend('agg')
 import tensorflow as tf
-import texar as tx
+import texar.tf as tx
 import numpy as np
-from texar.data import SpecialTokens
-from texar.modules.embedders import position_embedders
-from texar.utils.shapes import shape_list
-
+from texar.tf.data import SpecialTokens
+from texar.tf.modules.embedders import position_embedders
+from texar.tf.utils.shapes import shape_list
+import tx_utils
+import math
 import gan_hyperparams
 import bleu_tool
+from tensorflow.python.util import nest
+
+
+class SinusoidsSegmentalPositionEmbedder(tx.modules.EmbedderBase):
+    def __init__(self, hparams=None):
+        # EmbedderBase.__init__(self, hparams=hparams)
+        super().__init__(hparams=hparams)
+
+    def default_hparams(self):
+        """returns a dictionary of hyperparameters with default values
+        We use a geometric sequence of timescales starting with
+        min_timescale and ending with max_timescale. The number of different
+        timescales is equal to channels/2.
+        """
+        hparams = {
+            'name': 'sinusoid_segmental_posisiton_embedder',
+            'min_timescale': 1.0,
+            'max_timescale': 1.0e4,
+            'trainable': False,
+            'base': 256,
+        }
+        return hparams
+
+    def _build(self, length, channels, segment_ids, offsets):
+        """
+        :param length: an int
+        :param channels: an int
+        :param segment_id: [batch_size, length]
+        :param segment_offset: [batch_size, length]
+        :return: [batch_size, length, channels]
+        """
+        # TODO(wanrong): check if segment_ids is of shape [batch_size, length]
+        position = tf.to_float(tf.add(tf.multiply(tf.cast(256, tf.int64), segment_ids),
+                                      offsets))
+        num_timescales = channels // 2
+        min_timescale = 1.0
+        max_timescale = 1.0e4
+        log_timescale_increment = (
+            math.log(float(max_timescale) / float(min_timescale)) /
+            (tf.to_float(num_timescales) - 1))
+        inv_timescales = min_timescale * tf.exp(
+            tf.to_float(tf.range(num_timescales)) * -log_timescale_increment)
+        scaled_time = tf.expand_dims(position, 2) * inv_timescales
+        signal = tf.concat([tf.sin(scaled_time), tf.cos(scaled_time)], axis=2)
+        signal = tf.reshape(signal, shape=[-1, length, channels])
+        return signal
+
+class BasicPositionalRNNDecoder(tx.modules.RNNDecoderBase):
+    def __init__(self,
+                 cell=None,
+                 cell_dropout_mode=None,
+                 vocab_size=None,
+                 output_layer=None,
+                 position_embedder=None,
+                 hparams=None):
+        super().__init__(cell, vocab_size, output_layer, cell_dropout_mode, hparams)
+        self.position_embedder = position_embedder
+        self.current_segment_id = -1
+
+    @staticmethod
+    def default_hparams():
+        """Returns a dictionary of hyperparameters with default values.
+        .. code-block:: python
+            {
+                "rnn_cell": default_rnn_cell_hparams(),
+                "max_decoding_length_train": None,
+                "max_decoding_length_infer": None,
+                "helper_train": {
+                    "type": "TrainingHelper",
+                    "kwargs": {}
+                }
+                "helper_infer": {
+                    "type": "SampleEmbeddingHelper",
+                    "kwargs": {}
+                }
+                "name": "basic_rnn_decoder"
+            }
+        Here:
+        "rnn_cell": dict
+            A dictionary of RNN cell hyperparameters. Ignored if
+            :attr:`cell` is given to the decoder constructor.
+            The default value is defined in
+            :func:`~texar.tf.core.default_rnn_cell_hparams`.
+        "max_decoding_length_train": int or None
+            Maximum allowed number of decoding steps in training mode.
+            If `None` (default), decoding is
+            performed until fully done, e.g., encountering the <EOS> token.
+            Ignored if `max_decoding_length` is given when calling
+            the decoder.
+        "max_decoding_length_infer": int or None
+            Same as "max_decoding_length_train" but for inference mode.
+        "helper_train": dict
+            The hyperparameters of the helper used in training.
+            "type" can be a helper class, its name or module path, or a
+            helper instance. If a class name is given, the class must be
+            from module :tf_main:`tf.contrib.seq2seq <contrib/seq2seq>`,
+            :mod:`texar.tf.modules`, or :mod:`texar.tf.custom`. This is used
+            only when both `decoding_strategy` and `helper` augments are
+            `None` when calling the decoder. See
+            :meth:`~texar.tf.modules.RNNDecoderBase._build` for more details.
+        "helper_infer": dict
+            Same as "helper_train" but during inference mode.
+        "name": str
+            Name of the decoder.
+            The default value is "basic_rnn_decoder".
+        """
+        hparams = tx.modules.RNNDecoderBase.default_hparams()
+        hparams["name"] = "basic_rnn_decoder"
+        return hparams
+
+    def initialize(self, name=None):
+        return self._helper.initialize() + (self._initial_state,)
+
+
+#     def step(self, time, inputs, state, name=None):
+#         cell_outputs, cell_state = self._cell(inputs, state)
+#         logits = self._output_layer(cell_outputs)  # turn cell outputs into logits for for each vocab
+#         sample_ids = self._helper.sample(  # turn logits into ids
+#             time=time, outputs=logits, state=cell_state)
+#         (finished, next_inputs_word_embeds, next_state) = self._helper.next_inputs(
+#             time=time,
+#             outputs=logits,
+#             state=cell_state,
+#             sample_ids=sample_ids)  # look up in embedding -> next_inputs
+#         batch_size, channels = shape_list(next_inputs_word_embeds)
+#         next_input_pos_embeds = self.position_embedder(
+#             length=1,
+#             channels=channels,
+#             segment_ids=tf.cast(tf.fill([batch_size, 1], self.current_segment_id), dtype=tf.int64),
+#             offsets=tf.cast(tf.fill([batch_size, 1], time), dtype=tf.int64))
+#         next_input_pos_embeds = tf.reshape(next_input_pos_embeds, [batch_size, channels])
+#         next_inputs = next_inputs_word_embeds + next_input_pos_embeds
+#         outputs = tx.modules.BasicRNNDecoderOutput(logits, sample_ids, cell_outputs)
+#         return (outputs, next_state, next_inputs, finished)
+    def step(self, time, inputs, state, name=None):
+        cell_outputs, cell_state = self._cell(inputs, state)
+        logits = self._output_layer(cell_outputs)
+        sample_ids = self._helper.sample(
+            time=time, outputs=logits, state=cell_state)
+        outputs = tx.modules.BasicRNNDecoderOutput(logits, sample_ids, cell_outputs)
+        return outputs, cell_state
+
+    def next_inputs(self, time, outputs, state):
+        (finished, next_inputs_word_embeds, next_state) = self._helper.next_inputs(
+            time=time,
+            outputs=outputs.logits,
+            state=state,
+            sample_ids=outputs.sample_id)
+        batch_size, channels = shape_list(next_inputs_word_embeds)
+        next_input_pos_embeds = self.position_embedder(
+            length=1,
+            channels=channels,
+            segment_ids=tf.cast(tf.fill([batch_size, 1], self.current_segment_id), dtype=tf.int64),
+            offsets=tf.cast(tf.fill([batch_size, 1], time), dtype=tf.int64))
+        next_input_pos_embeds = tf.reshape(next_input_pos_embeds, [batch_size, channels])
+        next_inputs = next_inputs_word_embeds + next_input_pos_embeds
+        return finished, next_inputs, next_state
+
+    def finalize(self, outputs, final_state, sequence_lengths):
+        return outputs, final_state
+
+    @property
+    def output_size(self):
+        """Output size of one step.
+        """
+        return tx.modules.BasicRNNDecoderOutput(
+            logits=self._rnn_output_size(),
+            sample_id=self._helper.sample_ids_shape,
+            cell_output=self._cell.output_size)
+
+    @property
+    def output_dtype(self):
+        """Types of output of one step.
+        """
+        # Assume the dtype of the cell is the output_size structure
+        # containing the input_state's first component's dtype.
+        # Return that structure and the sample_ids_dtype from the helper.
+        dtype = nest.flatten(self._initial_state)[0].dtype
+        return tx.modules.BasicRNNDecoderOutput(
+            logits=nest.map_structure(lambda _: dtype, self._rnn_output_size()),
+            sample_id=self._helper.sample_ids_dtype,
+            cell_output=nest.map_structure(
+                lambda _: dtype, self._cell.output_size))
+    
+    def set_segment_id(self, segment_id):
+        self.current_segment_id = segment_id
+
+# class BasicPositionalRNNDecoder(tx.modules.RNNDecoderBase):
+#     def __init__(self,
+#                  cell=None,
+#                  cell_dropout_mode=None,
+#                  vocab_size=None,
+#                  output_layer=None,
+#                  position_embedder=None,
+#                  hparams=None):
+#         super().__init__(cell, vocab_size, output_layer, cell_dropout_mode, hparams)
+#         self.position_embedder = position_embedder
+#         self.current_segment_id = -1
+
+#     @staticmethod
+#     def default_hparams():
+#         """Returns a dictionary of hyperparameters with default values.
+
+#         Returns:
+#             .. code-block:: python
+
+#                 {
+#                     "rnn_cell": default_rnn_cell_hparams(),
+#                     "helper_train": default_helper_train_hparams(),
+#                     "helper_infer": default_helper_infer_hparams(),
+#                     "max_decoding_length_train": None,
+#                     "max_decoding_length_infer": None,
+#                     "name": "basic_rnn_decoder"
+#                 }
+
+#             Here:
+
+#             "rnn_cell" : dict
+#                 A dictionary of RNN cell hyperparameters. Ignored if
+#                 :attr:`cell` is given when constructing the decoder.
+
+#                 The default value is defined in
+#                 :meth:`~texar.core.layers.default_rnn_cell_hparams`.
+
+#             "helper_train" : dict
+#                 A dictionary of :class:`Helper` hyperparameters. The
+#                 helper is used in training phase.
+
+#                 The default value is defined in
+#                 :meth:`~texar.modules.default_helper_train_hparams`
+
+#             "helper_infer": dict
+#                 A dictionary of :class:`Helper` hyperparameters. The
+#                 helper is used in inference phase.
+
+#                 The default value is defined in
+#                 :meth:`~texar.modules.default_helper_infer_hparams`
+
+#             "max_decoding_length_train": int or None
+#                 Maximum allowed number of decoding steps in training mode..
+
+#                 The default is `None`, which means decoding is
+#                 performed until fully done, e.g., encountering the <EOS> token.
+
+#             "max_decoding_length_infer" : int or None
+#                 Maximum allowed number of decoding steps in inference mode.
+
+#                 The default is `None`, which means decoding is
+#                 performed until fully done, e.g., encountering the <EOS> token.
+
+#             "name" : str
+#                 Name of the decoder.
+
+#                 The default value is "basic_rnn_decoder".
+#         """
+#         hparams = tx.modules.RNNDecoderBase.default_hparams()
+#         hparams["name"] = "basic_rnn_decoder"
+#         return hparams
+
+#     def initialize(self, name=None):
+#         return self._helper.initialize() + (self._initial_state,)
+
+#     def step(self, time, inputs, state, name=None):
+#         cell_outputs, cell_state = self._cell(inputs, state)
+#         logits = self._output_layer(cell_outputs)  # turn cell outputs into logits for for each vocab
+#         sample_ids = self._helper.sample(  # turn logits into ids
+#             time=time, outputs=logits, state=cell_state)
+#         (finished, next_inputs_word_embeds, next_state) = self._helper.next_inputs(
+#             time=time,
+#             outputs=logits,
+#             state=cell_state,
+#             sample_ids=sample_ids)  # look up in embedding -> next_inputs
+#         batch_size, channels = shape_list(next_inputs_word_embeds)
+#         next_input_pos_embeds = self.position_embedder(
+#             length=1,
+#             channels=channels,
+#             segment_ids=tf.cast(tf.fill([batch_size, 1], self.current_segment_id), dtype=tf.int64),
+#             offsets=tf.cast(tf.fill([batch_size, 1], time), dtype=tf.int64))
+#         next_input_pos_embeds = tf.reshape(next_input_pos_embeds, [batch_size, channels])
+#         next_inputs = next_inputs_word_embeds + next_input_pos_embeds
+#         outputs = tx.modules.BasicRNNDecoderOutput(logits, sample_ids, cell_outputs)
+#         return (outputs, next_state, next_inputs, finished)
+
+#     def finalize(self, outputs, final_state, sequence_lengths):
+#         return outputs, final_state
+
+#     @property
+#     def output_size(self):
+#         """Output size of one step.
+#         """
+#         return tx.modules.BasicRNNDecoderOutput(
+#             logits=self._rnn_output_size(),
+#             sample_id=self._helper.sample_ids_shape,
+#             cell_output=self._cell.output_size)
+
+#     @property
+#     def output_dtype(self):
+#         """Types of output of one step.
+#         """
+#         # Assume the dtype of the cell is the output_size structure
+#         # containing the input_state's first component's dtype.
+#         # Return that structure and the sample_ids_dtype from the helper.
+#         dtype = nest.flatten(self._initial_state)[0].dtype
+#         return tx.modules.BasicRNNDecoderOutput(
+#             logits=nest.map_structure(lambda _: dtype, self._rnn_output_size()),
+#             sample_id=self._helper.sample_ids_dtype,
+#             cell_output=nest.map_structure(
+#                 lambda _: dtype, self._cell.output_size))
+
+#     def set_segment_id(self, segment_id):
+#         self.current_segment_id = segment_id
 
 
 def _main(_):
@@ -59,7 +371,7 @@ def _main(_):
     eos_id = train_data.vocab.token_to_id_map_py[SpecialTokens.EOS]
     pad_id = train_data.vocab.token_to_id_map_py['<PAD>']
     template_pack, answer_packs = \
-        tx.utils.prepare_template(data_batch, args, mask_id, boa_id, eoa_id, pad_id)
+        tx_utils.prepare_template(data_batch, args, mask_id, boa_id, eoa_id, pad_id)
 
     gamma = tf.placeholder(dtype=tf.float32, shape=[], name='gamma')
     lambda_g = tf.placeholder(dtype=tf.float32, shape=[], name='lambda_g')
@@ -67,9 +379,9 @@ def _main(_):
     # Model architecture
     embedder = tx.modules.WordEmbedder(vocab_size=train_data.vocab.size,
                                        hparams=args.word_embedding_hparams)
-    position_embedder = position_embedders.SinusoidsSegmentalPositionEmbedder()
+    position_embedder = SinusoidsSegmentalPositionEmbedder()
     encoder = tx.modules.UnidirectionalRNNEncoder(hparams=encoder_hparams)
-    decoder = tx.modules.BasicPositionalRNNDecoder(vocab_size=train_data.vocab.size,
+    decoder = BasicPositionalRNNDecoder(vocab_size=train_data.vocab.size,
                                                    hparams=decoder_hparams,
                                                    position_embedder=position_embedder)
     decoder_initial_state_size = decoder.cell.state_size
@@ -111,7 +423,7 @@ def _main(_):
             decoding_strategy="train_greedy",
             inputs=dec_input_embedded,
             sequence_length=hole["lengths"] + 1)
-        cur_loss = tx.utils.smoothing_cross_entropy(
+        cur_loss = tx_utils.smoothing_cross_entropy(
             outputs.logits,
             hole['text_ids'][:, 1:],
             train_data.vocab.size,
@@ -141,7 +453,7 @@ def _main(_):
         g_class_loss = loss_g_clas if g_class_loss is None \
             else tf.concat([g_class_loss, loss_g_clas], -1)
 
-        cur_template_pack = tx.utils.update_template_pack(cur_template_pack,
+        cur_template_pack = tx_utils.update_template_pack(cur_template_pack,
                                                           hole['text_ids'][:, 1:],
                                                           mask_id, eoa_id, pad_id)
     cetp_loss = tf.reduce_mean(cetp_loss)
@@ -196,13 +508,13 @@ def _main(_):
 
         decoder.set_segment_id(1)
         outputs_infer, _, _ = decoder(
-            decoding_strategy="infer_positional",
+            decoding_strategy="infer_greedy",
             start_tokens=start_tokens,
             end_token=eoa_id,
             embedding=embedder,
             initial_state=dcdr_init_states)
         predictions.append(outputs_infer.sample_id)
-        cur_test_pack = tx.utils.update_template_pack(cur_test_pack,
+        cur_test_pack = tx_utils.update_template_pack(cur_test_pack,
                                                       outputs_infer.sample_id,
                                                       mask_id, eoa_id, pad_id)
 
@@ -286,7 +598,7 @@ def _main(_):
                 ppl_lists.append(ppl)
 
                 filled_templates = \
-                    tx.utils.fill_template(template_pack=rtns['template'],
+                    tx_utils.fill_template(template_pack=rtns['template'],
                                            predictions=rtns['predictions'],
                                            eoa_id=eoa_id, pad_id=pad_id, eos_id=eos_id)
 

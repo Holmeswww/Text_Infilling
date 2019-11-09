@@ -5,7 +5,7 @@ configurate the hyperparameters, based on command line arguments.
 import argparse
 import os
 
-from texar.data import SpecialTokens
+from texar.tf.data import SpecialTokens
 
 
 class Hyperparams:
